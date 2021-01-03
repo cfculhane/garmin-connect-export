@@ -52,7 +52,7 @@ def test_sanitize_filename():
 
 
 def test_load_properties_keys():
-    with open('csv_header_default.properties', 'r') as prop:
+    with open('csv_header_default.yaml', 'r') as prop:
         csv_header_props = prop.read()
     csv_columns = []
     csv_headers = load_properties(csv_header_props, keys=csv_columns)
@@ -82,7 +82,7 @@ def test_csv_write_record():
     extract['device'] = "some device"
 
     csv_file = StringIO()
-    csv_filter = CsvFilter(csv_file, 'csv_header_default.properties')
+    csv_filter = CsvFilter(csv_file, 'csv_header_default.yaml')
     csv_write_record(csv_filter, extract, activities[0], details, activity_type_name, event_type_name)
     assert csv_file.getvalue()[:20] == '"Biel 🏛 Pavillon"'
 

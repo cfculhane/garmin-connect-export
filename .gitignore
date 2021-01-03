@@ -8,6 +8,7 @@ extras/
 *.log
 lint*.txt
 sync_garmin_connect.bat
+/logs
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

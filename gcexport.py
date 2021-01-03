@@ -16,8 +16,6 @@ Activity & event types:
     https://connect.garmin.com/modern/main/js/properties/activity_types/activity_types.properties
 """
 
-# this avoids different pylint behaviour for python 2 and 3
-
 
 import argparse
 import csv
@@ -28,23 +26,26 @@ import re
 import string
 import sys
 import unicodedata
-import urllib.error
-import urllib.parse
-import urllib.request
 import zipfile
 from datetime import datetime, timedelta, tzinfo
 from getpass import getpass
 from math import floor
-from os import makedirs, rename, remove, stat, utime
-from os.path import dirname, isdir, isfile, join, realpath, splitext
+from os import stat, utime
+from os.path import dirname, join, realpath
 from pathlib import Path
-from subprocess import call
-from typing import Dict
-from urllib.parse import urlencode
+from typing import Dict, Union
 
 import requests
+from pprintpp import pprint
+from tqdm import tqdm
 
-SCRIPT_VERSION = '2.3.0'
+from shared_logging import setup_logging
+from utilities import load_yaml, load_properties, get_valid_filename
+
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("requests").setLevel(logging.WARNING)
+
+__version__ = '3.0.0'
 
 # this is almost the datetime format Garmin used in the activity-search-service
 # JSON 'display' fields (Garmin didn't zero-pad the date and the hour, but %d and %H do)
@@ -73,13 +74,13 @@ PARENT_TYPE_ID = {
 USES_PACE = {1, 3, 9}  # running, hiking, walking
 
 # Maximum number of activities you can request at once.
-# Used to be 100 and enforced by Garmin for older endpoints; for the current endpoint 'URL_GC_LIST'
+# Used to be 100 and enforced by Garmin for older endpoints; for the current endpoint 'LIST'
 # the limit is not known (I have less than 1000 activities and could get them all in one go)
 LIMIT_MAXIMUM = 1000
 
 MAX_TRIES = 3
 
-CSV_TEMPLATE = join(dirname(realpath(__file__)), "csv_header_default.properties")
+CSV_TEMPLATE = join(dirname(realpath(__file__)), "csv_header_default.yaml")
 
 WEBHOST = "https://connect.garmin.com"
 REDIRECT = "https://connect.garmin.com/modern/"
@@ -87,7 +88,7 @@ BASE_URL = "https://connect.garmin.com/en-US/signin"
 SSO = "https://sso.garmin.com/sso"
 CSS = "https://static.garmincdn.com/com.garmin.connect/ui/css/gauth-custom-v1.2-min.css"
 
-DATA = {
+LOGIN_PARAMS = {
     'service': REDIRECT,
     'webhost': WEBHOST,
     'source': BASE_URL,
@@ -116,21 +117,6 @@ DATA = {
     'locationPromptShown': 'true',
     'showPassword': 'true'
 }
-
-# URLs for various services.
-URL_GC_LOGIN = 'https://sso.garmin.com/sso/signin?' + urlencode(DATA)
-URL_GC_POST_AUTH = 'https://connect.garmin.com/modern/activities?'
-URL_GC_PROFILE = 'https://connect.garmin.com/modern/profile'
-URL_GC_USERSTATS = 'https://connect.garmin.com/modern/proxy/userstats-service/statistics/'
-URL_GC_LIST = 'https://connect.garmin.com/modern/proxy/activitylist-service/activities/search/activities?'
-URL_GC_ACTIVITY = 'https://connect.garmin.com/modern/proxy/activity-service/activity/'
-URL_GC_DEVICE = 'https://connect.garmin.com/modern/proxy/device-service/deviceservice/app-info/'
-URL_GC_GEAR = 'https://connect.garmin.com/modern/proxy/gear-service/gear/filterGear?activityId='
-URL_GC_ACT_PROPS = 'https://connect.garmin.com/modern/main/js/properties/activity_types/activity_types.properties'
-URL_GC_EVT_PROPS = 'https://connect.garmin.com/modern/main/js/properties/event_types/event_types.properties'
-URL_GC_GPX_ACTIVITY = 'https://connect.garmin.com/modern/proxy/download-service/export/gpx/activity/'
-URL_GC_TCX_ACTIVITY = 'https://connect.garmin.com/modern/proxy/download-service/export/tcx/activity/'
-URL_GC_ORIGINAL_ACTIVITY = 'http://connect.garmin.com/proxy/download-service/files/activity/'
 
 
 def resolve_path(directory, subdir, time):
@@ -180,35 +166,6 @@ def write_to_file(filename, content, mode, file_time=None):
         f.write(content)
     if file_time:
         utime(filename, (file_time, file_time))
-
-
-# idea stolen from https://stackoverflow.com/a/31852401/3686
-def load_properties(multiline, sep='=', comment_char='#', keys=None):
-    """
-    Read a multiline string of properties (key/value pair separated by *sep*) into a dict
-
-    :param multiline:    input string of properties
-    :param sep:          separator between key and value
-    :param comment_char: lines starting with this char are considered comments, not key/value pairs
-    :param keys:         list to append the keys to
-    :return:
-    """
-    props = {}
-    for line in multiline.splitlines():
-        stripped_line = line.strip()
-        if stripped_line and not stripped_line.startswith(comment_char):
-            key_value = stripped_line.split(sep)
-            key = key_value[0].strip()
-            value = sep.join(key_value[1:]).strip().strip('"')
-            props[key] = value
-            if keys != None:
-                keys.append(key)
-    return props
-
-
-def value_if_found_else_key(some_dict, key):
-    """Lookup a value in some_dict and use the key itself as fallback"""
-    return some_dict.get(key, key)
 
 
 def absent_or_null(element, act):
@@ -336,7 +293,7 @@ def parse_arguments() -> Dict:
 
     parser = argparse.ArgumentParser(description='Garmin Connect Exporter')
 
-    parser.add_argument('--version', action='version', version='%(prog)s ' + SCRIPT_VERSION,
+    parser.add_argument('--version', action='version', version='%(prog)s ' + __version__,
                         help='print version and exit')
     parser.add_argument('-v', '--verbosity', action='count',
                         help='increase output verbosity')
@@ -371,57 +328,6 @@ def parse_arguments() -> Dict:
 
     parsed_args = vars(parser.parse_args())
     return parsed_args
-
-
-def login_to_garmin_connect(args) -> requests.Session:
-    """
-    Perform all HTTP requests to login to Garmin Connect.
-    """
-    session = requests.session()
-    username = args["username"] if args["username"] else input('Username: ')
-    password = args["password"] if args["password"] else getpass()
-
-    logging.debug("Login params: %s", urlencode(DATA))
-
-    logging.info('Connecting to Garmin Connect...')
-    logging.info('Connecting to %s', URL_GC_LOGIN)
-    connect_response = session.get(URL_GC_LOGIN)
-    # write_to_file('connect_response.html', connect_response, 'w')
-
-    print(' Done.')
-
-    # Now we'll actually login.
-    # Fields that are passed in a typical Garmin login.
-    post_data = {
-        'username': username,
-        'password': password,
-        'embed': 'false',
-        'rememberme': 'on'
-    }
-
-    headers = {
-        'referer': URL_GC_LOGIN
-    }
-
-    print('Requesting Login ticket...', end='')
-    login_response = session.post(URL_GC_LOGIN + '#', data=post_data, headers=headers)
-
-    # write_to_file('login-response.html', login_response, 'w')
-
-    # extract the ticket from the login response
-    pattern = re.compile(r".*\?ticket=([-\w]+)\";.*", re.MULTILINE | re.DOTALL)
-    match = pattern.match(login_response.text)
-    if not match:
-        raise Exception('Couldn\'t find ticket in the login response. Cannot log in. '
-                        'Did you enter the correct username and password?')
-    login_ticket = match.group(1)
-    print(' Done. Ticket=' + login_ticket)
-
-    print("Authenticating...", end='')
-    logging.info('Authentication URL %s', URL_GC_POST_AUTH + 'ticket=' + login_ticket)
-    session.get(URL_GC_POST_AUTH + 'ticket=' + login_ticket)
-    print(' Done.')
-    return session
 
 
 def csv_write_record(csv_filter, extract, actvty, details, activity_type_name, event_type_name):
@@ -619,184 +525,6 @@ def csv_write_record(csv_filter, extract, actvty, details, activity_type_name, e
     csv_filter.write_row()
 
 
-def extract_device(device_dict: Dict, details, start_time_seconds, args, session:requests.Session, export_dir: Path):
-    """
-    Try to get the device details (and cache them, as they're used for multiple activities)
-    """
-    if "metadataDTO" not in details:
-        logging.warning("no metadataDTO")
-        return None
-
-    metadata = details['metadataDTO']
-    device_app_inst_id = metadata['deviceApplicationInstallationId'] if present('deviceApplicationInstallationId',
-                                                                                metadata) else None
-    if device_app_inst_id:
-        if device_app_inst_id not in device_dict:
-            # observed from my stock of activities:
-            # details['metadataDTO']['deviceMetaDataDTO']['deviceId'] == null -> device unknown
-            # details['metadataDTO']['deviceMetaDataDTO']['deviceId'] == '0' -> device unknown
-            # details['metadataDTO']['deviceMetaDataDTO']['deviceId'] == 'someid' -> device known
-            device_dict[device_app_inst_id] = None
-            device_meta = metadata.get('deviceMetaDataDTO')
-            device_id = device_meta.get('deviceId')
-            if 'deviceId' not in device_meta or device_id and device_id != '0':
-                device_json_req = session.get(URL_GC_DEVICE + str(device_app_inst_id))
-                export_dir.joinpath(f"device_{device_app_inst_id}.json").write_text(device_json_req.text)
-                if device_json_req.ok is False:
-                    logging.warning(f"Device Details {device_app_inst_id} are empty")
-                    device_dict[device_app_inst_id] = "device-id:" + str(device_app_inst_id)
-                else:
-                    device_details = json.loads(device_json_req.text)
-                    if 'productDisplayName' in device_details:
-                        device_dict[device_app_inst_id] = device_details['productDisplayName'] + ' ' \
-                                                          + device_details['versionString']
-                    else:
-                        logging.warning(f"Device details {device_app_inst_id} incomplete")
-        return device_dict[device_app_inst_id]
-    return None
-
-
-def load_gear(session: requests.Session, activity_id, args):
-    """Retrieve the gear/equipment for an activity"""
-    try:
-        gear_json = session.get(URL_GC_GEAR + activity_id)
-        gear = json.loads(gear_json)
-        if gear:
-            del args  # keep 'args' argument in case you need to uncomment write_to_file
-            # write_to_file(args["directory"] + '/activity_' + activity_id + '-gear.json',
-            #               gear_json, 'w')
-            gear_display_name = gear[0]['displayName'] if present('displayName', gear[0]) else None
-            gear_model = gear[0]['customMakeModel'] if present('customMakeModel', gear[0]) else None
-            logging.debug("Gear for %s = %s/%s", activity_id, gear_display_name, gear_model)
-            return gear_display_name if gear_display_name else gear_model
-        return None
-    except urllib.error.HTTPError:
-        pass  # don't abort just for missing gear...
-        # logging.info("Unable to get gear for %d", activity_id)
-        # logging.exception(e)
-
-
-def export_data_file(activity_id, activity_details, args, file_time, append_desc, start_time_locale):
-    """
-    Write the data of the activity to a file, depending on the chosen data format
-    """
-    # timestamp as prefix for filename
-    if args["fileprefix"] > 0:
-        prefix = "{}-".format(start_time_locale.replace("-", "").replace(":", b"").replace(" ", "-"))
-    else:
-        prefix = ""
-
-    # Time dependent download path
-    if not args["subdir"] is None:
-        directory = resolve_path(args["directory"], args["subdir"], start_time_locale)
-    else:
-        directory = args["directory"]
-    # print("export_data_file directroy={}".format(directory))
-
-    if not isdir(directory):
-        makedirs(directory)
-
-    if args["format"] == 'gpx':
-        data_filename = directory + '/' + prefix + 'activity_' + activity_id + append_desc + '.gpx'
-        download_url = URL_GC_GPX_ACTIVITY + activity_id + '?full=true'
-        file_mode = 'w'
-    elif args["format"] == 'tcx':
-        data_filename = directory + '/' + prefix + 'activity_' + activity_id + append_desc + '.tcx'
-        download_url = URL_GC_TCX_ACTIVITY + activity_id + '?full=true'
-        file_mode = 'w'
-    elif args["format"] == 'original':
-        data_filename = directory + '/' + prefix + 'activity_' + activity_id + append_desc + '.zip'
-        # TODO not all 'original' files are in FIT format, some are GPX or TCX...
-        fit_filename = directory + '/' + prefix + 'activity_' + activity_id + append_desc + '.fit'
-        download_url = URL_GC_ORIGINAL_ACTIVITY + activity_id
-        file_mode = 'wb'
-    elif args["format"] == 'json':
-        data_filename = directory + '/' + prefix + 'activity_' + activity_id + append_desc + '.json'
-        file_mode = 'w'
-    else:
-        raise Exception('Unrecognized format.')
-
-    if isfile(data_filename):
-        logging.debug('Data file for %s already exists', activity_id)
-        print('\tData file already exists; skipping...')
-        return
-
-    # Regardless of unzip setting, don't redownload if the ZIP or FIT file exists.
-    if args["format"] == 'original' and isfile(fit_filename):
-        logging.debug('Original data file for %s already exists', activity_id)
-        print('\tFIT data file already exists; skipping...')
-        return
-
-    if args["format"] != 'json':
-        # Download the data file from Garmin Connect. If the download fails (e.g., due to timeout),
-        # this script will die, but nothing will have been written to disk about this activity, so
-        # just running it again should pick up where it left off.
-
-        try:
-            data = requests.get(download_url)
-        except urllib.error.HTTPError as ex:
-            # Handle expected (though unfortunate) error codes; die on unexpected ones.
-            if ex.code == 500 and args["format"] == 'tcx':
-                # Garmin will give an internal server error (HTTP 500) when downloading TCX files
-                # if the original was a manual GPX upload. Writing an empty file prevents this file
-                # from being redownloaded, similar to the way GPX files are saved even when there
-                # are no tracks. One could be generated here, but that's a bit much. Use the GPX
-                # format if you want actual data in every file, as I believe Garmin provides a GPX
-                # file for every activity.
-                logging.info('Writing empty file since Garmin did not generate a TCX file for this \
-                             activity...')
-                data = ''
-            elif ex.code == 404 and args["format"] == 'original':
-                # For manual activities (i.e., entered in online without a file upload), there is
-                # no original file. # Write an empty file to prevent redownloading it.
-                logging.info('Writing empty file since there was no original activity data...')
-                data = ''
-            else:
-                logging.info('Got %s for %s', ex.code, download_url)
-                raise Exception('Failed. Got an HTTP error ' + str(ex.code) + ' for ' + download_url)
-    else:
-        data = activity_details
-
-    # Persist file
-    write_to_file(data_filename, data, file_mode, file_time)
-    if args["format"] == 'original':
-        # Even manual upload of a GPX file is zipped, but we'll validate the extension.
-        if args["unzip"] and data_filename[-3:].lower() == 'zip':
-            logging.debug('Unzipping and removing original file, size is %s', stat(data_filename).st_size)
-            if stat(data_filename).st_size > 0:
-                zip_file = open(data_filename, 'rb')
-                zip_obj = zipfile.ZipFile(zip_file)
-                for name in zip_obj.namelist():
-                    unzipped_name = zip_obj.extract(name, directory)
-                    name_unzipped_base, name_unzipped_ext = splitext(name)
-                    fit_filename_name_base, name_ext = splitext(fit_filename)
-                    new_name = fit_filename_name_base + name_unzipped_ext
-                    logging.debug('renaming %s to %s', unzipped_name, new_name)
-                    rename(unzipped_name, new_name)
-                    if file_time:
-                        utime(new_name, (file_time, file_time))
-                zip_file.close()
-            else:
-                print('\tSkipping 0Kb zip file.')
-            remove(data_filename)
-
-
-def setup_logging():
-    """Setup logging"""
-    logging.basicConfig(
-        filename='gcexport.log',
-        level=logging.DEBUG,
-        format='%(asctime)s [%(levelname)-7.7s] %(message)s'
-    )
-
-    # set up logging to console
-    console = logging.StreamHandler()
-    console.setLevel(logging.WARN)
-    formatter = logging.Formatter('[%(levelname)s] %(message)s')
-    console.setFormatter(formatter)
-    logging.getLogger('').addHandler(console)
-
-
 def logging_verbosity(verbosity):
     """Adapt logging verbosity, separately for logfile and console output"""
     logger = logging.getLogger()
@@ -851,6 +579,321 @@ def read_settings(settings_dir):
         return dict(activity_indices=dict(tcx=0, gpx=0, json=0, original=0))
 
 
+class GarminConnect(object):
+    """ Class to represent connection to GarminConnect"""
+
+    urls = load_yaml(Path(__file__).parent.joinpath("settings.yaml"))["urls"]
+
+    def __init__(self, username: str = None, password: str = None, export_dir: Path = None):
+        self.session = requests.Session()  # main session object to hold all cookies, requests etc
+        self.export_dir = export_dir or Path("exports")
+
+        self.auth_ticket = self.login(self.session, username, password)
+
+        self.activity_tyes = self.get_activity_types()
+        self.event_types = self.get_event_types()
+        self.userstats = self.get_userstats()
+
+    def login(self, session: requests.Session, username: str, password: str) -> str:
+        """
+        Perform all HTTP requests to login to Garmin Connect.
+        """
+        username = username or input('Username: ')
+        password = password or getpass()
+
+        logger.info('Connecting to Garmin Connect...')
+        logger.info('Connecting to %s', self.urls["LOGIN"])
+        connect_response = session.get(self.urls["LOGIN"], params=LOGIN_PARAMS)
+
+        # Fields that are passed in a typical Garmin login.
+        post_data = {
+            'username': username,
+            'password': password,
+            'embed': 'false',
+            'rememberme': 'on'
+        }
+
+        headers = {
+            'referer': self.urls["LOGIN"]
+        }
+
+        logger.info('Requesting Login ticket...')
+        login_req = session.post(self.urls["LOGIN"], params=LOGIN_PARAMS, data=post_data, headers=headers)
+
+        # Extract the ticket from the login response
+        pattern = re.compile(r".*\?ticket=([-\w]+)\";.*", re.MULTILINE | re.DOTALL)
+        match = pattern.match(login_req.text)
+        if not match:
+            raise RuntimeError('Couldn\'t find ticket in the login response. Cannot log in. '
+                               'Did you enter the correct username and password?')
+        login_ticket = match.group(1)
+        print(' Done. Ticket=' + login_ticket)
+
+        print("Authenticating...", end='')
+        logging.info(f"Authentication URL {self.urls['POST_AUTH']},  ticket={login_ticket}")
+        session.get(self.urls["POST_AUTH"], params={'ticket': login_ticket})
+
+        return login_ticket
+
+    def get_userstats(self) -> Dict:
+        """ Get user stats and return dict from JSON response"""
+        logging.info('Fetching user stats...')
+        logging.info('Userstats page %s', self.urls["USERSTATS"])
+        user_stats_req = self.session.get(self.urls["USERSTATS"])
+        if user_stats_req.ok is True:
+            return json.loads(user_stats_req.text)
+        else:
+            raise requests.HTTPError("Could not get user stats!")
+
+    def get_activity_types(self) -> Dict:
+        activity_type_req = self.session.get(self.urls["ACT_PROPS"])
+        return load_properties(activity_type_req.text)
+
+    def get_event_types(self) -> Dict:
+        event_type_req = self.session.get(self.urls["EVT_PROPS"])
+        return load_properties(event_type_req.text)
+
+    def get_n_activites(self, count: Union[int, str]) -> int:
+        """
+        Gets activities
+
+        :param count: Can be int number of activities, or 'all' for all activities, 'new' for new ones.
+        :returns:
+        """
+        if isinstance(count, int):
+            total_n = count
+        elif count == 'all':
+            total_n = int(self.userstats['userMetrics'][0]['totalActivities'])
+        # elif count == 'new':
+        # TODO implement cache
+
+        #     total_n = int(self.userstats['userMetrics'][0]['totalActivities']) - \
+        #               read_settings(args["directory"])['activity_indices'][args["format"]]
+        else:
+            raise ValueError(f"count must be int, 'all' or 'new'! Supplied count: {count}")
+        if total_n == 0:
+            logger.warning("No new activities.")
+        return total_n
+
+    def get_activity_details(self, activity_id: str) -> Dict:
+        """ Gets detailed activity details """
+        # Retrieve also the detail data from the activity (the one displayed on
+        # the https://connect.garmin.com/modern/activity/xxx page), because some
+        # data are missing from 'a' (or are even different)
+
+        for tries in range(MAX_TRIES):
+            activity_details_req = self.session.get(self.urls["ACTIVITY"] + f"/{activity_id}")
+            details = json.loads(activity_details_req.text)
+            if details.get('summaryDTO') is not None:
+                break
+            else:
+                logging.warning(
+                    f"Retrying activity details download for activityId {activity_id}")
+        else:  # no break
+            raise RuntimeError(
+                f"Did not get summaryDTO after {MAX_TRIES} tries for activityId {activity_id}")
+
+        return details
+
+    def get_activities(self, count: Union[int, str]):
+        downloaded_n = 0
+        device_dict = dict()  # TODO Read from cache?
+        total_n = self.get_n_activites(count)
+
+        # This while loop will download data from the server in multiple chunks, if necessary.
+        while downloaded_n < total_n:
+            # Maximum chunk size 'LIMIT_MAXIMUM' ... 400 return status if over maximum.  So download
+            # maximum or whatever remains if less than maximum.
+            # As of 2018-03-06 I get return status 500 if over maximum
+            if total_n - downloaded_n > LIMIT_MAXIMUM:
+                num_to_download = LIMIT_MAXIMUM
+            else:
+                num_to_download = total_n - downloaded_n
+
+            search_params = {'start': downloaded_n, 'limit': num_to_download}
+            activity_list_req = self.session.get(self.urls["LIST"], params=search_params)
+
+            # TODO Cache activities
+
+            all_activities = json.loads(activity_list_req.text)
+            if len(all_activities) != num_to_download:
+                logging.warning('Expected %s activities, got %s.', num_to_download, len(all_activities))
+
+            # Process each activity; start with the oldest one
+            for i, activity in tqdm(enumerate(reversed(all_activities)), total=len(all_activities)):
+                activity_id = str(activity['activityId'])
+                logger.info(f"Processing Garmin Connect activity_id {activity_id}: {activity['activityName']}")
+                activity_details = self.get_activity_details(activity_id=activity_id)
+
+                extract = {}
+                extract['start_time_with_offset'] = offset_date_time(activity['startTimeLocal'],
+                                                                     activity['startTimeGMT'])
+                elapsed_duration = activity_details['summaryDTO'][
+                    'elapsedDuration'] if 'summaryDTO' in activity_details and 'elapsedDuration' in activity_details[
+                    'summaryDTO'] else None
+                extract['elapsed_duration'] = elapsed_duration if elapsed_duration else activity['duration']
+                extract['elapsed_seconds'] = int(round(extract['elapsed_duration']))
+                extract['end_time_with_offset'] = extract['start_time_with_offset'] + timedelta(
+                    seconds=extract['elapsed_seconds'])
+
+                print('\t' + extract['start_time_with_offset'].isoformat() + ', ', end='')
+                print(hhmmss_from_seconds(extract['elapsed_seconds']) + ', ', end='')
+                if 'distance' in activity and isinstance(activity['distance'], (float)):
+                    print("{0:.3f}".format(activity['distance'] / 1000) + 'km')
+                else:
+                    print('0.000 km')
+
+                extract['device'] = self.extract_device(device_dict, activity_details)
+
+                # try to get the JSON with all the samples (not all activities have it...),
+                # but only if it's really needed for the CSV output
+                # extract['samples'] = None
+                # if csv_filter.is_column_active('sampleCount'):
+                #     try:
+                #         # TODO implement retries here, I have observed temporary failures
+                #         activity_measurements = session.get(
+                #             ACTIVITY + activity_id + "/details").text
+                #         write_to_file(args["directory"] + '/activity_' + activity_id + '_samples.json',
+                #                       activity_measurements, 'w',
+                #                       start_time_seconds)
+                #         samples = json.loads(activity_measurements)
+                #         extract['samples'] = samples
+                #     except urllib.error.HTTPError:
+                #         pass  # don't abort just for missing samples...
+                #         # logging.info("Unable to get samples for %d", actvty['activityId'])
+                #         # logging.exception(e)
+
+                extract['gear'] = self.load_gear(activity_id)
+
+                # Write stats to CSV.
+                # csv_write_record(csv_filter, extract, activity, details, activity_type_name, event_type_name)
+
+                self.download_activity(activity_details, activity['startTimeLocal'], format="ORIGINAL")
+
+                # # Regardless if file was written or already exists
+                # write_last_activity_index(args["directory"],
+                #                           int(json_results['userMetrics'][0]['totalActivities']) -
+                #                           total_n + current_index,
+                #                           args["format"])
+
+            # End for loop for activities of chunk
+            downloaded_n += num_to_download
+
+    def extract_device(self, device_dict: Dict, activity_details: Dict):
+        """
+        Try to get the device activity_details (and cache them, as they're used for multiple activities)
+        """
+        if "metadataDTO" not in activity_details:
+            logging.warning("no metadataDTO")
+            return None
+        else:
+            metadata = activity_details['metadataDTO']
+            device_app_inst_id = metadata.get('deviceApplicationInstallationId')
+
+        if device_app_inst_id is not None:
+            if device_app_inst_id not in device_dict:
+                # observed from my stock of activities:
+                # activity_details['metadataDTO']['deviceMetaDataDTO']['deviceId'] == null -> device unknown
+                # activity_details['metadataDTO']['deviceMetaDataDTO']['deviceId'] == '0' -> device unknown
+                # activity_details['metadataDTO']['deviceMetaDataDTO']['deviceId'] == 'someid' -> device known
+                device_dict[device_app_inst_id] = None
+                device_meta = metadata.get('deviceMetaDataDTO')
+                device_id = device_meta.get('deviceId')
+                if 'deviceId' not in device_meta or device_id and device_id != '0':
+                    device_json_req = self.session.get(self.urls["DEVICE"] + str(device_app_inst_id))
+                    # export_dir.joinpath(f"device_{device_app_inst_id}.json").write_text(device_json_req.text)
+                    if device_json_req.ok is False:
+                        logging.warning(f"Device Details {device_app_inst_id} are empty")
+                        device_dict[device_app_inst_id] = "device-id:" + str(device_app_inst_id)
+                    else:
+                        device_details = json.loads(device_json_req.text)
+                        if 'productDisplayName' in device_details:
+                            device_dict[device_app_inst_id] = device_details['productDisplayName'] + ' ' \
+                                                              + device_details['versionString']
+                        else:
+                            logging.warning(f"Device activity_details {device_app_inst_id} incomplete")
+            return device_dict[device_app_inst_id]
+        else:
+            return None
+
+    def load_gear(self, activity_id: str):
+        """ Retrieve the gear/equipment for an activity """
+
+        gear_req = self.session.get(f"{self.urls['GEAR']}/{activity_id}")
+        if gear_req.ok is True:
+            params = {"activityId": activity_id}
+            gear = json.loads(gear_req.text)
+            if len(gear) > 0:
+                gear_display_name = gear[0].get('displayName')
+                gear_model = gear[0].get('customMakeModel')
+                logging.debug("Gear for %s = %s/%s", activity_id, gear_display_name, gear_model)
+                return gear_display_name if gear_display_name else gear_model
+            else:
+                return None
+        else:
+            logging.debug(f"Unable to get gear for activity_id {activity_id}")
+            return None  # Don't abort just for missing gear
+
+    def download_activity(self, activity_details: Dict, start_time_locale, format: str = "ORIGINAL"):
+        """
+        Write the data of the activity to a file, depending on the chosen data format
+        """
+        allowed_formats = ["ORIGINAL", "GPX", "JSON"]
+        if format not in allowed_formats:
+            raise ValueError(f"format '{format}' not recognised. Must be one of {allowed_formats}")
+        activity_id = activity_details["activityId"]
+
+        download_url = f"{self.urls[f'{format.upper()}_ACTIVITY']}/{activity_id}"
+        download_params = {"full": "true"}
+        start_time_locale = get_valid_filename(start_time_locale)  # Remove illegal characters
+        if format != "ORIGINAL":
+            download_filename = self.export_dir.joinpath(f"{start_time_locale}_{activity_id}.{format}")
+        else:
+            download_filename = self.export_dir.joinpath(f"{start_time_locale}_{activity_id}.zip")
+
+        if download_filename.exists():
+            logger.debug(f"Skipping already-existing file: {download_filename}")
+            return False
+
+        if format != 'JSON':
+            dl_req = self.session.get(download_url, params=download_params)
+
+            # Handle expected (though unfortunate) error codes; die on unexpected ones.
+            if dl_req.status_code == 404 and format == "ORIGINAL":
+                # For manual activities (i.e., entered in online without a file upload), there is
+                # no original file. Write an empty file to prevent redownloading it.
+                logging.info('Writing empty file since there was no original activity data...')
+                raw_data = b''
+            elif dl_req.ok is False:
+                raise Exception('Failed. Got an HTTP error ' + str(dl_req.status_code) + ' for ' + download_url)
+            else:
+                raw_data = dl_req.content
+
+        else:
+            raw_data = activity_details
+
+        Path(download_filename).absolute().write_bytes(raw_data)
+
+        # Persist file
+        if format == 'ORIGINAL':
+            # Even manual upload of a GPX file is zipped, but we'll validate the extension.
+            file_size = stat(download_filename).st_size
+            logging.debug(f"Unzipping and removing original file, size is {file_size}")
+            if file_size > 0:
+                with open(download_filename, "rb") as zip_file:
+                    zip_obj = zipfile.ZipFile(zip_file)
+                    for name in zip_obj.namelist():
+                        unzipped_name = Path(zip_obj.extract(name, self.export_dir))
+                        file_type = unzipped_name.suffix
+                        new_name = download_filename.with_suffix(file_type)
+                        logging.debug(f"Renaming {unzipped_name} to {new_name}")
+                        unzipped_name.rename(new_name)
+            else:
+                logger.warning(f"Skipping 0Kb zip file for activity_id {activity_id}")
+                Path(download_filename).unlink()
+        return True
+
+
 def main(**kwargs):
     """
     Main entry point for gcexport.py
@@ -868,205 +911,29 @@ def main(**kwargs):
     print('Welcome to Garmin Connect Exporter!')
 
     # Create directory for data files.
-    if isdir(args["directory"]):
-        logging.warning("Output directory %s already exists. "
-                        "Will skip already-downloaded files and append to the CSV file.",
-                        args["directory"])
-
-    session = login_to_garmin_connect(args)
-
-    # We should be logged in now.
-    export_dir = Path(args["directory"])
+    export_dir = Path(args.get("export_dir"))
     export_dir.mkdir(parents=True, exist_ok=True)
     export_csv = export_dir.joinpath("activities.csv")
-    need_header = True if (export_csv.exists() is False) else False
-    with open(export_csv, "a") as csv_file:
-        csv_filter = CsvFilter(csv_file, args["template"])
-        if need_header:
-            csv_filter.write_header()
 
-    # Query the userstats, we need the activity index for storing in .settings file on the profile page to know how many are available
-    logging.info('Fetching user stats...')
-    logging.info('Userstats page %s', URL_GC_USERSTATS)
-    user_stats_req = session.get(URL_GC_USERSTATS)
-    print(' Done.')
+    garmin_connect = GarminConnect(username=args.get("username"), password=args.get("password"), export_dir=export_dir)
 
-    # Persist JSON
-    export_dir.joinpath("userstats.json").write_text(user_stats_req.text)
+    activities = garmin_connect.get_activities(count="all")
 
-    # Modify total_to_download based on how many activities the server reports.
-    # index holds the actual activity index number
-    user_stats = json.loads(user_stats_req.text)
+    logger.debug(pprint(garmin_connect.userstats, width=200))
 
-    if args["count"] == 'all':
-        total_to_download = int(user_stats['userMetrics'][0]['totalActivities'])
-
-    elif args["count"] == 'new':
-        total_to_download = int(user_stats['userMetrics'][0]['totalActivities']) - \
-                            read_settings(args["directory"])['activity_indices'][args["format"]]
-    else:
-        total_to_download = int(args["count"])
-
-    # Now index holds the lowest activity nr to download
-    total_downloaded = 0
-
-    device_dict = dict()
-
-    # load some dictionaries with lookup data from REST services
-    activity_type_props = session.get(URL_GC_ACT_PROPS).text
-    # write_to_file(args["directory"] + '/activity_types.properties', activity_type_props, 'a')
-    activity_type_name = load_properties(activity_type_props)
-    event_type_props = session.get(URL_GC_EVT_PROPS)
-    # write_to_file(args["directory"] + '/event_types.properties', event_type_props, 'a')
-    event_type_name = load_properties(event_type_props)
-
-    if total_to_download == 0:
-        print("Now new activities.")
-
-    # This while loop will download data from the server in multiple chunks, if necessary.
-    while total_downloaded < total_to_download:
-        # Maximum chunk size 'LIMIT_MAXIMUM' ... 400 return status if over maximum.  So download
-        # maximum or whatever remains if less than maximum.
-        # As of 2018-03-06 I get return status 500 if over maximum
-        if total_to_download - total_downloaded > LIMIT_MAXIMUM:
-            num_to_download = LIMIT_MAXIMUM
-        else:
-            num_to_download = total_to_download - total_downloaded
-
-        search_params = {'start': total_downloaded, 'limit': num_to_download}
-        # Query Garmin Connect
-        print('Querying list of activities ' + str(total_downloaded + 1) \
-              + '..' + str(total_downloaded + num_to_download) \
-              + '...', end='')
-        logging.info('Activity list URL %s', URL_GC_LIST + urlencode(search_params))
-        result = session.get(URL_GC_LIST + urlencode(search_params)).text
-        print(' Done.')
-
-        # Persist JSON activities list
-        current_index = total_downloaded + 1
-        activities_list_filename = '/activities-' \
-                                   + str(current_index) + '-' \
-                                   + str(total_downloaded + num_to_download) + '.json'
-        write_to_file(args["directory"] + activities_list_filename, result, 'w')
-
-        activities = json.loads(result)
-        if len(activities) != num_to_download:
-            logging.warning('Expected %s activities, got %s.', num_to_download, len(activities))
-
-        # Process each activity; start with the oldest one
-        for actvty in activities[::-1]:
-            # Display which entry we're working on.
-            print('Garmin Connect activity ', end='')
-            print('(' + str(current_index) + '/' + str(total_to_download) + ') ', end='')
-            print('[' + str(actvty['activityId']) + '] ', end='')
-            print(actvty['activityName'])
-
-            # Retrieve also the detail data from the activity (the one displayed on
-            # the https://connect.garmin.com/modern/activity/xxx page), because some
-            # data are missing from 'a' (or are even different, e.g. for my activities
-            # 86497297 or 86516281)
-            activity_details = None
-            details = None
-            tries = MAX_TRIES
-            while tries > 0:
-                activity_details = session.get(URL_GC_ACTIVITY + str(actvty['activityId'])).text
-                details = json.loads(activity_details)
-                # I observed a failure to get a complete JSON detail in about 5-10 calls out of 1000
-                # retrying then statistically gets a better JSON ;-)
-                if details['summaryDTO']:
-                    tries = 0
-                else:
-                    logging.info("Retrying activity details download %s", URL_GC_ACTIVITY + str(actvty['activityId']))
-                    tries -= 1
-                    if tries == 0:
-                        raise Exception('Didn\'t get "summaryDTO" after ' + str(MAX_TRIES) + ' tries for ' + str(
-                            actvty['activityId']))
-
-            extract = {}
-            extract['start_time_with_offset'] = offset_date_time(actvty['startTimeLocal'], actvty['startTimeGMT'])
-            elapsed_duration = details['summaryDTO'][
-                'elapsedDuration'] if 'summaryDTO' in details and 'elapsedDuration' in details['summaryDTO'] else None
-            extract['elapsed_duration'] = elapsed_duration if elapsed_duration else actvty['duration']
-            extract['elapsed_seconds'] = int(round(extract['elapsed_duration']))
-            extract['end_time_with_offset'] = extract['start_time_with_offset'] + timedelta(
-                seconds=extract['elapsed_seconds'])
-
-            print('\t' + extract['start_time_with_offset'].isoformat() + ', ', end='')
-            print(hhmmss_from_seconds(extract['elapsed_seconds']) + ', ', end='')
-            if 'distance' in actvty and isinstance(actvty['distance'], (float)):
-                print("{0:.3f}".format(actvty['distance'] / 1000) + 'km')
-            else:
-                print('0.000 km')
-
-            if args["desc"] != None:
-                append_desc = '_' + sanitize_filename(actvty['activityName'], args["desc"])
-            else:
-                append_desc = ''
-
-            if args["originaltime"]:
-                start_time_seconds = actvty['beginTimestamp'] // 1000 if present('beginTimestamp', actvty) else None
-            else:
-                start_time_seconds = None
-
-            extract['device'] = extract_device(device_dict, details, start_time_seconds, args, session,
-                                               export_dir=export_dir)
-
-            # try to get the JSON with all the samples (not all activities have it...),
-            # but only if it's really needed for the CSV output
-            extract['samples'] = None
-            if csv_filter.is_column_active('sampleCount'):
-                try:
-                    # TODO implement retries here, I have observed temporary failures
-                    activity_measurements = session.get(URL_GC_ACTIVITY + str(actvty['activityId']) + "/details").text
-                    write_to_file(args["directory"] + '/activity_' + str(actvty['activityId']) + '_samples.json',
-                                  activity_measurements, 'w',
-                                  start_time_seconds)
-                    samples = json.loads(activity_measurements)
-                    extract['samples'] = samples
-                except urllib.error.HTTPError:
-                    pass  # don't abort just for missing samples...
-                    # logging.info("Unable to get samples for %d", actvty['activityId'])
-                    # logging.exception(e)
-
-            extract['gear'] = None
-            if csv_filter.is_column_active('gear'):
-                extract['gear'] = load_gear(session, str(actvty['activityId']), args)
-
-            # Write stats to CSV.
-            csv_write_record(csv_filter, extract, actvty, details, activity_type_name, event_type_name)
-
-            export_data_file(str(actvty['activityId']), activity_details, args, start_time_seconds, append_desc,
-                             actvty['startTimeLocal'])
-
-            # Regardless if file was written or already exists
-            write_last_activity_index(args["directory"],
-                                      int(json_results['userMetrics'][0]['totalActivities']) -
-                                      total_to_download + current_index,
-                                      args["format"])
-
-            current_index += 1
-        # End for loop for activities of chunk
-        total_downloaded += num_to_download
-    # End while loop for multiple chunks.
-
-    csv_file.close()
-
-    if args.get("external") is not None:
-        print('Open CSV output.')
-        call([args["external"], "--" + args["external_args"], str(export_csv.absolute())])
-
-    print('Done!')
+    logger.info(f"Export completed to {export_dir}")
 
 
 if __name__ == "__main__":
+    logger, log_filename = setup_logging(log_config_path="logging_config.yaml", log_dir="logs", module_name=__name__,
+                                         default_level=logging.DEBUG)
     try:
         # main(sys.argv)
         test_args = {"count": "all",
-                     "directory": r"",
+                     "export_dir": r"C:\GitHub\garmin-connect-export\exports",
                      "format": "original",
-                     "username": "",
-                     "password": "",
-                     "desc": 100,
+                     "username": "cfculhane@gmail.com",
+                     "password": "^wI&4Cf3J@wRAnYjF1Fp",
                      "subdir": "{YYYY}",
                      "template": CSV_TEMPLATE
                      }

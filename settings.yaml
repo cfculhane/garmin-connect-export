@@ -1,0 +1,24 @@
+# Settings for garmin-connect-export
+# Do not modify unless you know what you're doing!
+
+# Global variables
+global:
+
+# Paths used throughout the program. Use / instead of \ (will be parsed as a pathlib.Path object)
+paths:
+
+urls:
+    # URLs for various services.
+   LOGIN: "https://sso.garmin.com/sso/signin"
+   POST_AUTH: "https://connect.garmin.com/modern/activities"
+   PROFILE: "https://connect.garmin.com/modern/profile"
+   USERSTATS: "https://connect.garmin.com/modern/proxy/userstats-service/statistics"
+   LIST: "https://connect.garmin.com/modern/proxy/activitylist-service/activities/search/activities"
+   ACTIVITY: "https://connect.garmin.com/modern/proxy/activity-service/activity"
+   DEVICE: "https://connect.garmin.com/modern/proxy/device-service/deviceservice/app-info"
+   GEAR: "https://connect.garmin.com/modern/proxy/gear-service/gear/filterGear"
+   ACT_PROPS: "https://connect.garmin.com/modern/main/js/properties/activity_types/activity_types.properties"
+   EVT_PROPS: "https://connect.garmin.com/modern/main/js/properties/event_types/event_types.properties"
+   GPX_ACTIVITY: "https://connect.garmin.com/modern/proxy/download-service/export/gpx/activity"
+   TCX_ACTIVITY: "https://connect.garmin.com/modern/proxy/download-service/export/tcx/activity"
+   ORIGINAL_ACTIVITY: "http://connect.garmin.com/proxy/download-service/files/activity"
